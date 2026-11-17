@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Pomodoro
+Comment=Pomodoro timer with focus music
+Exec=@BIN@
+Icon=io.github.PomodoroGnome
+Terminal=false
+Categories=GNOME;GTK;Utility;Clock;
+Keywords=pomodoro;timer;focus;productivity;
+StartupNotify=true
+DBusActivatable=true
