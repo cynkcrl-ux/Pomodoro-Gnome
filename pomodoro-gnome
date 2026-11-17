@@ -20,19 +20,15 @@ import time
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Graphene", "1.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
-
-try:
-    gi.require_foreign("cairo")
-    HAVE_CAIRO = True
-except ImportError:
-    HAVE_CAIRO = False
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk  # noqa: E402
 
 APP_ID = "io.github.PomodoroGnome"
 APP_NAME = "Pomodoro"
 VERSION = "1.0.0"
-SOURCE_URL = "https://github.com/alessandrobelli/omarchy-pomodoro"
+SOURCE_URL = "https://github.com/cynkcrl-ux/Pomodoro-Gnome"
 
 DEFAULT_CHANNELS = [
     {"name": "Lofi hip hop", "url": "https://www.youtube.com/watch?v=rFZHOHl-L8A"},
@@ -87,6 +83,7 @@ CONFIG_FILE = os.path.join(_xdg("XDG_CONFIG_HOME", ".config"), "pomodoro-gnome",
 STATE_FILE = os.path.join(_xdg("XDG_STATE_HOME", ".local/state"), "pomodoro-gnome", "state.json")
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
 MPV_SOCKET = os.path.join(RUNTIME_DIR, "pomodoro-gnome-mpv.sock")
+MPV_LOG = os.path.join(os.path.dirname(STATE_FILE), "mpv.log")
 
 
 def find_data(rel):
@@ -158,7 +155,7 @@ def spawn_quiet(args, die_with_parent=False):
 
 
 # --------------------------------------------------------------------------
-# Engine: timer, persistence and music. 
+# Engine: timer, persistence and music. No GTK widgets in here.
 # --------------------------------------------------------------------------
 
 class Engine:
@@ -179,6 +176,8 @@ class Engine:
         self.mpv_started = 0.0
         self.playing_channel = None
         self.music_failures = 0
+        self._failure_notified = False
+        self._watchdog_id = 0
         self._tick_id = 0
         self._retry_id = 0
         self._restart_id = 0
@@ -464,9 +463,17 @@ class Engine:
             self.notify("Music stopped", "Couldn't find the sound file.")
             return
         self._quit_stale_mpv()
+        try:
+            os.makedirs(os.path.dirname(MPV_LOG), exist_ok=True)
+        except OSError:
+            pass
         args = [
             "mpv", "--no-video", "--no-terminal", "--sid=no", "--loop-file=inf",
             "--ytdl-format=bestaudio/best",
+            # Ride out short network drops instead of quitting.
+            "--network-timeout=30",
+            "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=30",
+            "--log-file=" + MPV_LOG,
             "--volume=%d" % self.volume,
             "--input-ipc-server=" + MPV_SOCKET,
             "--force-media-title=Pomodoro · " + (self.channel_name(channel) or "music"),
@@ -483,6 +490,17 @@ class Engine:
         self.mpv_started = time.time()
         self.playing_channel = channel
         GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, self._mpv_exited, proc)
+        if not self._watchdog_id:
+            self._watchdog_id = GLib.timeout_add_seconds(10, self._watchdog)
+
+    def _watchdog(self):
+        """Un-pause mpv if something else paused it (e.g. Bluetooth call mode)."""
+        if not self.mpv or not self.music_wanted:
+            self._watchdog_id = 0
+            return GLib.SOURCE_REMOVE
+        if self._mpv_get("pause") is True:
+            self._mpv_command("set_property", "pause", False)
+        return GLib.SOURCE_CONTINUE
 
     def _stop_music(self):
         proc, self.mpv = self.mpv, None
@@ -517,21 +535,50 @@ class Engine:
         self.playing_channel = None
         if not self.music_wanted:
             return
-        if time.time() - self.mpv_started > 60:
-            self.music_failures = 0
+        if time.time() - self.mpv_started > 120:
+            self.music_failures = 0  # it played fine for a while
+            self._failure_notified = False
         self.music_failures += 1
-        if self.music_failures <= 2:
-            self._retry_id = GLib.timeout_add_seconds(5, self._retry_music)
-        else:
-            self.music_failures = 0
+        # Streams drop now and then: keep reconnecting, backing off up to 30 s.
+        delay = (1, 3, 5, 10, 30)[min(self.music_failures, 5) - 1]
+        self._retry_id = GLib.timeout_add_seconds(delay, self._retry_music)
+        if self.music_failures >= 3 and not self._failure_notified:
+            self._failure_notified = True
             name = self.channel_name(self.channel) or "the stream"
-            self.notify("Music stopped",
-                        "Couldn't play %s. The timer keeps running." % name)
+            self.notify("Music keeps dropping",
+                        "Can't hold a connection to %s. Still retrying; "
+                        "the timer keeps running." % name)
 
     def _retry_music(self):
         self._retry_id = 0
         self.sync_music()
         return GLib.SOURCE_REMOVE
+
+    def _mpv_get(self, prop):
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(0.5)
+            s.connect(MPV_SOCKET)
+            s.sendall(json.dumps({"command": ["get_property", prop],
+                                  "request_id": 7}).encode() + b"\n")
+            buf = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                for line in buf.split(b"\n"):
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if msg.get("request_id") == 7:
+                        s.close()
+                        return msg.get("data")
+            s.close()
+        except OSError:
+            pass
+        return None
 
     def _mpv_command(self, *cmd):
         try:
@@ -561,6 +608,9 @@ class Engine:
                 return
 
     def shutdown(self):
+        if self._watchdog_id:
+            GLib.source_remove(self._watchdog_id)
+            self._watchdog_id = 0
         self._cancel_retry()
         self._stop_music()
 
@@ -569,63 +619,89 @@ class Engine:
 # Widgets
 # --------------------------------------------------------------------------
 
-class Ring(Gtk.DrawingArea):
-    """Circular progress, in the accent colour (green during breaks)."""
+class Ring(Gtk.Widget):
+    """Circular progress, in the accent colour (green during breaks).
+
+    Drawn with GSK nodes only, so it needs no pycairo."""
+
+    __gtype_name__ = "PomodoroRing"
+    SIZE = 230
+    LINE = 10
 
     def __init__(self):
         super().__init__()
-        self.set_content_width(250)
-        self.set_content_height(250)
         self.progress = 0.0
         self.is_break = False
         self.dimmed = False
-        if HAVE_CAIRO:
-            self.set_draw_func(self._draw)
 
     def update(self, progress, is_break, dimmed):
         self.progress, self.is_break, self.dimmed = progress, is_break, dimmed
         self.queue_draw()
 
-    def _lookup(self, name, fallback):
+    def do_measure(self, _orientation, _for_size):
+        return (self.SIZE, self.SIZE, -1, -1)
+
+    @staticmethod
+    def _rgba(r, g, b, a):
+        c = Gdk.RGBA()
+        c.red, c.green, c.blue, c.alpha = r, g, b, a
+        return c
+
+    def _accent(self):
+        name = "success_color" if self.is_break else "accent_color"
         try:
             ok, rgba = self.get_style_context().lookup_color(name)
             if ok:
                 return rgba
         except Exception:
             pass
-        return fallback
+        return self._rgba(0.2, 0.52, 0.89, 1) if not self.is_break else self._rgba(0.2, 0.82, 0.48, 1)
 
-    def _foreground(self):
-        try:
-            return self.get_color()
-        except AttributeError:
-            return self.get_style_context().get_color()
+    def do_snapshot(self, snapshot):
+        w, h = self.get_width(), self.get_height()
+        size = min(w, h)
+        x, y = (w - size) / 2.0, (h - size) / 2.0
+        rect = Graphene.Rect().init(x, y, size, size)
+        rounded = Gsk.RoundedRect()
+        rounded.init_from_rect(rect, size / 2.0)
+        widths = [float(self.LINE)] * 4
 
-    def _draw(self, _area, cr, width, height):
-        fg = self._foreground()
-        accent = self._lookup("success_color" if self.is_break else "accent_color", fg)
-        line = 10
-        radius = min(width, height) / 2 - line
-        cx, cy = width / 2, height / 2
-        cr.set_line_width(line)
-        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.10)
-        cr.arc(cx, cy, radius, 0, 2 * math.pi)
-        cr.stroke()
-        if self.progress > 0:
-            import cairo
-            cr.set_line_cap(cairo.LineCap.ROUND)
-            cr.set_source_rgba(accent.red, accent.green, accent.blue,
-                               0.5 if self.dimmed else 1.0)
-            start = -math.pi / 2
-            cr.arc(cx, cy, radius, start, start + 2 * math.pi * self.progress)
-            cr.stroke()
+        fg = self.get_color()
+        track = self._rgba(fg.red, fg.green, fg.blue, 0.10)
+        snapshot.append_border(rounded, widths, [track] * 4)
+
+        if self.progress <= 0:
+            return
+        p = max(0.0005, min(0.9995, self.progress))
+        accent = self._accent()
+        if self.dimmed:
+            accent = self._rgba(accent.red, accent.green, accent.blue, 0.5)
+        clear = self._rgba(accent.red, accent.green, accent.blue, 0.0)
+        stops = []
+        for offset, color in ((0.0, accent), (p, accent), (p + 0.0005, clear), (1.0, clear)):
+            stop = Gsk.ColorStop()
+            stop.offset, stop.color = offset, color
+            stops.append(stop)
+        center = Graphene.Point().init(x + size / 2.0, y + size / 2.0)
+        # The conic gradient, cut down to the ring's outline.
+        snapshot.push_mask(Gsk.MaskMode.ALPHA)
+        snapshot.append_border(rounded, widths, [self._rgba(0, 0, 0, 1)] * 4)
+        snapshot.pop()
+        snapshot.append_conic_gradient(rect, center, 0.0, stops)
+        snapshot.pop()
 
 
 class PomodoroWindow(Adw.ApplicationWindow):
     def __init__(self, app, engine):
+        height = 680
+        try:
+            monitor = Gdk.Display.get_default().get_monitors().get_item(0)
+            height = min(height, int(monitor.get_geometry().height * 0.75))
+        except Exception:
+            pass
         super().__init__(application=app, title=APP_NAME,
-                         default_width=460, default_height=820)
-        self.set_size_request(360, 480)
+                         default_width=440, default_height=max(420, height))
+        self.set_size_request(340, 420)
         self.engine = engine
         self._guard = False
         self._music_rows = []
@@ -692,8 +768,6 @@ class PomodoroWindow(Adw.ApplicationWindow):
         overlay.add_overlay(inner)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.append(overlay)
-        self.fallback_bar = Gtk.ProgressBar(visible=not HAVE_CAIRO)
-        box.append(self.fallback_bar)
         return box
 
     def _build_controls(self):
@@ -857,7 +931,6 @@ class PomodoroWindow(Adw.ApplicationWindow):
         self.session_label.set_label(session)
         self.session_label.set_visible(bool(session))
         self.ring.update(e.progress, e.phase == "break", e.paused)
-        self.fallback_bar.set_fraction(e.progress)
 
         if e.running:
             self.play_btn.set_icon_name("media-playback-pause-symbolic")
@@ -980,7 +1053,6 @@ class PomodoroApp(Adw.Application):
             provider.load_from_string(CSS)
         except AttributeError:
             provider.load_from_data(CSS.encode())
-        from gi.repository import Gdk
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -1004,6 +1076,7 @@ class PomodoroApp(Adw.Application):
         self.set_accels_for_action("app.start-pause", ["<primary>space"])
         self.set_accels_for_action("app.preferences", ["<primary>comma"])
         self.set_accels_for_action("app.quit", ["<primary>q"])
+        self.set_accels_for_action("window.close", ["<primary>w"])
         self._on_engine("state")
 
     def do_activate(self):
@@ -1038,7 +1111,7 @@ class PomodoroApp(Adw.Application):
             comments="A pomodoro timer with YouTube live streams or ambient sounds "
                      "as focus music. Vibe coded GNOME port of omarchy-pomodoro.",
             website=SOURCE_URL,
-            copyright="© 2026 Cydrek Carillo. Based on omarchy-pomodoro © 2026 Alessandro Belli",
+            copyright="© 2026 Cydrek Carillo © 2026 Alessandro Belli",
             license_type=Gtk.License.MIT_X11,
         )
         dialog.add_acknowledgement_section(
