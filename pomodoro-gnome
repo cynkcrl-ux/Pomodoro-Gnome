@@ -6,9 +6,11 @@
 # Same timer, same focus music (mpv + yt-dlp), but as a regular GNOME app
 # instead of a Quickshell bar widget.
 
+import datetime
 import json
 import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -23,12 +25,12 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.PomodoroGnome"
 APP_NAME = "Pomodoro"
-VERSION = "1.0.0"
-SOURCE_URL = "https://github.com/alessandrobelli/omarchy-pomodoro"
+VERSION = "1.1.0"
+SOURCE_URL = "https://github.com/cynkcrl-ux/Pomodoro-Gnome"
 
 DEFAULT_CHANNELS = [
     {"name": "Lofi hip hop", "url": "https://www.youtube.com/watch?v=rFZHOHl-L8A"},
@@ -54,11 +56,26 @@ DEFAULT_SETTINGS = {
     "auto_continue": True,
     "chime": True,
     "volume": 60,
+    "long_break_minutes": 15,
+    "stream_mode": -1,      # -1 = automatic, else index into PROFILES
+    "stream_profile": 0,    # last profile that played reliably
     "channel": DEFAULT_CHANNELS[0]["url"],  # "", "ambient:<id>" or a URL
     "channels": DEFAULT_CHANNELS,
 }
 
 PRESETS = (25, 30, 50)
+CYCLE = 4  # focus sessions before a long break
+
+# YouTube sometimes rejects stream segments (HTTP 403) depending on how the
+# stream was requested, so we can fall back through different ways of asking.
+PROFILES = [
+    ("Default", []),
+    ("Android + Web client",
+     ['--ytdl-raw-options=extractor-args="youtube:player_client=android,web"']),
+    ("TV / embedded client",
+     ['--ytdl-raw-options=extractor-args="youtube:player_client=tv,android_vr,web_embedded"']),
+    ("Low bandwidth", ["--ytdl-format=worst"]),
+]
 URL_RE = re.compile(r"^https?://\S+$", re.I)
 
 CSS = """
@@ -68,6 +85,16 @@ CSS = """
   font-feature-settings: "tnum";
 }
 .pomo-play { min-width: 64px; min-height: 64px; }
+.phase-focus { background-color: alpha(@accent_bg_color, 0.06); }
+.phase-break { background-color: alpha(@success_bg_color, 0.10); }
+.pomo-dot { min-width: 10px; min-height: 10px; border-radius: 5px;
+            background-color: alpha(currentColor, 0.18); }
+.pomo-dot.filled { background-color: @accent_bg_color; }
+.phase-break .pomo-dot.filled { background-color: @success_bg_color; }
+.np-title { font-weight: 700; font-size: 13pt; }
+.eq-bar { background-color: @accent_bg_color; border-radius: 2px; }
+.week-bar { background-color: alpha(@accent_bg_color, 0.45); border-radius: 4px; }
+.week-bar.today { background-color: @accent_bg_color; }
 """
 
 
@@ -84,6 +111,7 @@ STATE_FILE = os.path.join(_xdg("XDG_STATE_HOME", ".local/state"), "pomodoro-gnom
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
 MPV_SOCKET = os.path.join(RUNTIME_DIR, "pomodoro-gnome-mpv.sock")
 MPV_LOG = os.path.join(os.path.dirname(STATE_FILE), "mpv.log")
+STATS_FILE = os.path.join(os.path.dirname(STATE_FILE), "stats.json")
 
 
 def find_data(rel):
@@ -113,6 +141,16 @@ def clamp_int(value, low, high, fallback):
 def format_time(ms):
     total = max(0, math.ceil(ms / 1000.0))
     return "%02d:%02d" % (total // 60, total % 60)
+
+
+def fmt_minutes(m):
+    m = int(m)
+    return "%dh %02dm" % (m // 60, m % 60) if m >= 60 else "%d min" % m
+
+
+def fmt_clock(sec):
+    sec = int(max(0, sec))
+    return "%d:%02d" % (sec // 60, sec % 60)
 
 
 def read_json(path):
@@ -159,13 +197,15 @@ def spawn_quiet(args, die_with_parent=False):
 # --------------------------------------------------------------------------
 
 class Engine:
-    def __init__(self, notify):
-        self.notify = notify          # notify(title, body)
-        self.listeners = []           # fn(event) with event "state" or "settings"
+    def __init__(self, notify, message=None):
+        self.notify = notify
+        self.message = message or notify
+        self.listeners = []
         self.settings = self._load_settings()
 
-        self.phase = "idle"           # idle | focus | break
+        self.phase = "idle"
         self.running = False
+        self.long_break = False
         self.ends_at = 0.0
         self.remaining_ms = 0.0
         self.total_ms = 0.0
@@ -178,6 +218,19 @@ class Engine:
         self.music_failures = 0
         self._failure_notified = False
         self._watchdog_id = 0
+        self._playing = False
+        self._last_pos = None
+        self._stalls = 0
+        self.now = {}
+        self.is_vod = False
+        self.user_paused = False
+        self._break_paused = False
+        self._good_marked = False
+        self._profile_idx = clamp_int(self.settings["stream_profile"], 0,
+                                      len(PROFILES) - 1, 0)
+        self._stats = read_json(STATS_FILE)
+        if not isinstance(self._stats, dict):
+            self._stats = {}
         self._tick_id = 0
         self._retry_id = 0
         self._restart_id = 0
@@ -207,6 +260,10 @@ class Engine:
     @property
     def break_minutes(self):
         return clamp_int(self.settings["break_minutes"], 1, 120, 5)
+
+    @property
+    def long_break_minutes(self):
+        return clamp_int(self.settings["long_break_minutes"], 1, 120, 15)
 
     @property
     def volume(self):
@@ -300,9 +357,13 @@ class Engine:
         self._schedule()
         self._emit("state")
 
-    def begin_phase(self, nxt):
-        minutes = self.break_minutes if nxt == "break" else self.focus_minutes
+    def begin_phase(self, nxt, long_break=False):
+        if nxt == "break":
+            minutes = self.long_break_minutes if long_break else self.break_minutes
+        else:
+            minutes = self.focus_minutes
         self.phase = nxt
+        self.long_break = bool(long_break) and nxt == "break"
         self.total_ms = minutes * 60000.0
         self.remaining_ms = self.total_ms
         self.now_ms = now_ms()
@@ -326,6 +387,7 @@ class Engine:
     def reset(self):
         self.phase = "idle"
         self.running = False
+        self.long_break = False
         self.remaining_ms = 0.0
         self.total_ms = 0.0
         self.sessions_done = 0
@@ -337,11 +399,15 @@ class Engine:
 
     def finish_phase(self, silent=False):
         if self.phase == "focus":
+            minutes = self.total_ms / 60000.0
             self.sessions_done += 1
+            long_break = self.sessions_done % CYCLE == 0
             if not silent:
-                self._announce("Focus done",
-                               "Take a %d minute break." % self.break_minutes)
-            self.begin_phase("break")
+                self.record_session(minutes)
+                length = self.long_break_minutes if long_break else self.break_minutes
+                self._announce("Focus done", "Take a %d minute %s." % (
+                    length, "long break" if long_break else "break"))
+            self.begin_phase("break", long_break)
         elif self.phase == "break":
             if self.settings["auto_continue"]:
                 if not silent:
@@ -353,6 +419,7 @@ class Engine:
                     self._announce("Break over",
                                    "Start the next focus session when you're ready.")
                 self.phase = "focus"
+                self.long_break = False
                 self.running = False
                 self.total_ms = self.focus_minutes * 60000.0
                 self.remaining_ms = self.total_ms
@@ -388,6 +455,7 @@ class Engine:
             "remaining_ms": self.remaining_ms,
             "total_ms": self.total_ms,
             "sessions_done": self.sessions_done,
+            "long_break": self.long_break,
         })
 
     def _restore_state(self):
@@ -402,6 +470,7 @@ class Engine:
             return
         self.sessions_done = clamp_int(saved.get("sessions_done"), 0, 10 ** 6, 0)
         self.phase = phase
+        self.long_break = bool(saved.get("long_break")) and phase == "break"
         self.total_ms = float(saved.get("total_ms") or 0) or (
             (self.break_minutes if phase == "break" else self.focus_minutes) * 60000.0)
         self.now_ms = now_ms()
@@ -423,6 +492,20 @@ class Engine:
             return False
         return True
 
+    @property
+    def music_status(self):
+        if self._break_paused:
+            return "Paused during break"
+        if not self.music_wanted:
+            return ""
+        if self.user_paused:
+            return "Paused"
+        if self._retry_id or self._restart_id:
+            return "Reconnecting…"
+        if self.mpv:
+            return "Playing" if self._playing else "Connecting…"
+        return ""
+
     def _source(self, channel):
         if channel.startswith("ambient:"):
             for amb_id, _label, _icon, src in AMBIENT:
@@ -431,8 +514,40 @@ class Engine:
             return None
         return channel
 
+    def _ytdl_args(self, channel):
+        if not channel.startswith("http"):
+            return []
+        mode = clamp_int(self.settings["stream_mode"], -1, len(PROFILES) - 1, -1)
+        idx = self._profile_idx if mode < 0 else mode
+        return list(PROFILES[idx][1])
+
+    def _escalate_profile(self):
+        mode = clamp_int(self.settings["stream_mode"], -1, len(PROFILES) - 1, -1)
+        if mode >= 0 or not self.channel.startswith("http"):
+            return
+        self._profile_idx = (self._profile_idx + 1) % len(PROFILES)
+        self.message("Trying another way to connect",
+                     "Using: " + PROFILES[self._profile_idx][0])
+
+    def _remember_profile(self):
+        mode = clamp_int(self.settings["stream_mode"], -1, len(PROFILES) - 1, -1)
+        if mode < 0 and self.settings["stream_profile"] != self._profile_idx:
+            self.settings["stream_profile"] = self._profile_idx
+            self._save_settings()
+
+    def set_stream_mode(self, mode):
+        self.settings["stream_mode"] = mode
+        self._save_settings()
+        if self.mpv:
+            self._restart_music()
+
     def sync_music(self):
         if self.music_wanted:
+            if self.mpv and self._break_paused:
+                self._break_paused = False
+                if not self.user_paused:
+                    self._mpv_command("set_property", "pause", False)
+                self._ensure_watchdog()
             if self.mpv and self.playing_channel != self.channel:
                 self._restart_music()
             elif not self.mpv and not self._retry_id and not self._restart_id:
@@ -440,7 +555,14 @@ class Engine:
         else:
             self._cancel_retry()
             if self.mpv:
-                self._stop_music()
+                # A normal video keeps its place across a break; a live stream can't.
+                if (self.running and self.phase == "break" and self.channel
+                        and self.is_vod):
+                    if not self._break_paused:
+                        self._break_paused = True
+                        self._mpv_command("set_property", "pause", True)
+                else:
+                    self._stop_music()
 
     def _cancel_retry(self):
         for attr in ("_retry_id", "_restart_id"):
@@ -460,7 +582,7 @@ class Engine:
         channel = self.channel
         source = self._source(channel)
         if not source:
-            self.notify("Music stopped", "Couldn't find the sound file.")
+            self.message("Music stopped", "Couldn't find the sound file.")
             return
         self._quit_stale_mpv()
         try:
@@ -468,43 +590,95 @@ class Engine:
         except OSError:
             pass
         args = [
-            "mpv", "--no-video", "--no-terminal", "--sid=no",
-            "--ytdl-format=bestaudio/best",
+            "mpv", "--no-video", "--no-terminal", "--sid=no", "--loop-playlist=inf",
             "--log-file=" + MPV_LOG,
             "--volume=%d" % self.volume,
             "--input-ipc-server=" + MPV_SOCKET,
-            "--force-media-title=Pomodoro · " + (self.channel_name(channel) or "music"),
         ]
+        args += self._ytdl_args(channel)
         args += os.environ.get("POMODORO_MPV_EXTRA", "").split()
         args += ["--", source]
         try:
             proc = spawn_quiet(args, die_with_parent=True)
         except FileNotFoundError:
-            self.notify("Music unavailable",
-                        "mpv isn't installed. The timer keeps running.")
+            self.message("Music unavailable",
+                         "mpv isn't installed. The timer keeps running.")
             return
         self.mpv = proc
         self.mpv_started = time.time()
+        self._playing = False
+        self._last_pos = None
+        self._stalls = 0
+        self._good_marked = False
+        self.user_paused = False
+        self._break_paused = False
+        self.is_vod = False
+        self.now = {}
         self.playing_channel = channel
         GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, self._mpv_exited, proc)
-        if not self._watchdog_id:
-            self._watchdog_id = GLib.timeout_add_seconds(10, self._watchdog)
+        self._ensure_watchdog()
+
+    def _ensure_watchdog(self):
+        if not self._watchdog_id and self.mpv:
+            self._watchdog_id = GLib.timeout_add_seconds(2, self._watchdog)
 
     def _watchdog(self):
-        """Un-pause mpv if something else paused it (e.g. Bluetooth call mode)."""
+        """Every 2 s: refresh track info, un-pause stray pauses, replace a stalled mpv."""
         if not self.mpv or not self.music_wanted:
             self._watchdog_id = 0
             return GLib.SOURCE_REMOVE
-        if self._mpv_get("pause") is True:
+        info = self._mpv_get_many("pause", "time-pos", "duration", "media-title",
+                                  "playlist-pos", "playlist-count")
+        pos, dur = info.get("time-pos"), info.get("duration")
+        self.now = {"title": info.get("media-title"), "pos": pos, "dur": dur,
+                    "idx": info.get("playlist-pos"), "count": info.get("playlist-count")}
+        self.is_vod = isinstance(dur, (int, float)) and dur > 0
+        if info.get("pause") is True and not self.user_paused:
             self._mpv_command("set_property", "pause", False)
+            self._stalls = 0
+        elif self.user_paused:
+            self._stalls = 0
+        else:
+            age = time.time() - self.mpv_started
+            if isinstance(pos, (int, float)) and (
+                    self._last_pos is None or pos > self._last_pos + 0.2):
+                self._last_pos = pos
+                self._stalls = 0
+                self._playing = True
+                if age > 150 and not self._good_marked:
+                    self._good_marked = True
+                    self.music_failures = 0
+                    self._failure_notified = False
+                    self._remember_profile()
+            elif age > 15:
+                self._stalls += 1
+                self._playing = False
+                if self._stalls >= 6:  # about 12 s without progress
+                    self._on_stall()
+        self._emit("state")
         return GLib.SOURCE_CONTINUE
 
-    def _stop_music(self):
+    def _on_stall(self):
+        self.music_failures += 1
+        self._escalate_profile()
+        self._stop_music(force=True)
+        self._restart_music()
+        if self.music_failures >= len(PROFILES) and not self._failure_notified:
+            self._failure_notified = True
+            self.message("Music keeps failing",
+                         "Update yt-dlp, then check Show Music Log in the menu.")
+
+    def _stop_music(self, force=False):
         proc, self.mpv = self.mpv, None
         self.playing_channel = None
+        self._playing = False
+        self._break_paused = False
+        self.user_paused = False
+        self.is_vod = False
+        self.now = {}
         if proc:
             try:
-                proc.terminate()
+                proc.kill() if force else proc.terminate()
             except OSError:
                 pass
 
@@ -530,44 +704,47 @@ class Engine:
             return  # we stopped it on purpose
         self.mpv = None
         self.playing_channel = None
+        self._playing = False
         if not self.music_wanted:
             return
-        # A clean exit after playing a while means the track or stream ended:
-        # just start it again (this is what looping does for plain videos).
+        age = time.time() - self.mpv_started
         clean = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-        if clean and time.time() - self.mpv_started > 10:
+        if clean and age > 10:
             self.music_failures = 0
             self._retry_id = GLib.timeout_add_seconds(1, self._retry_music)
             return
-        if time.time() - self.mpv_started > 120:
-            self.music_failures = 0  # it played fine for a while
+        if age < 60:
+            self._escalate_profile()
+        if age > 120:
+            self.music_failures = 0
             self._failure_notified = False
         self.music_failures += 1
-        # Streams drop now and then: keep reconnecting, backing off up to 30 s.
         delay = (1, 3, 5, 10, 30)[min(self.music_failures, 5) - 1]
         self._retry_id = GLib.timeout_add_seconds(delay, self._retry_music)
         if self.music_failures >= 3 and not self._failure_notified:
             self._failure_notified = True
             name = self.channel_name(self.channel) or "the stream"
-            self.notify("Music keeps dropping",
-                        "Can't hold a connection to %s. Still retrying; "
-                        "the timer keeps running." % name)
+            self.message("Music keeps dropping",
+                         "Can't hold a connection to %s. Still retrying." % name)
 
     def _retry_music(self):
         self._retry_id = 0
         self.sync_music()
         return GLib.SOURCE_REMOVE
 
-    def _mpv_get(self, prop):
+    def _mpv_get_many(self, *props):
+        """Ask mpv for several properties over one connection."""
+        result = {}
         try:
             s = socket.socket(socket.AF_UNIX)
             s.settimeout(0.5)
             s.connect(MPV_SOCKET)
-            s.sendall(json.dumps({"command": ["get_property", prop],
-                                  "request_id": 7}).encode() + b"\n")
+            for i, prop in enumerate(props):
+                s.sendall(json.dumps({"command": ["get_property", prop],
+                                      "request_id": 100 + i}).encode() + b"\n")
             buf = b""
-            while True:
-                chunk = s.recv(4096)
+            while len(result) < len(props):
+                chunk = s.recv(8192)
                 if not chunk:
                     break
                 buf += chunk
@@ -576,13 +753,13 @@ class Engine:
                         msg = json.loads(line)
                     except ValueError:
                         continue
-                    if msg.get("request_id") == 7:
-                        s.close()
-                        return msg.get("data")
+                    rid = msg.get("request_id")
+                    if isinstance(rid, int) and 100 <= rid < 100 + len(props):
+                        result[props[rid - 100]] = msg.get("data")
             s.close()
         except OSError:
             pass
-        return None
+        return result
 
     def _mpv_command(self, *cmd):
         try:
@@ -594,6 +771,54 @@ class Engine:
             return True
         except OSError:
             return False
+
+    # ---- music player controls -------------------------------------------
+
+    def music_toggle_pause(self):
+        if not self.mpv:
+            return
+        self.user_paused = not self.user_paused
+        self._mpv_command("set_property", "pause", self.user_paused)
+        self._emit("state")
+
+    def music_next(self):
+        self._mpv_command("playlist-next")
+
+    def music_prev(self):
+        count = self.now.get("count") or 0
+        if count > 1 and (self.now.get("pos") or 0) < 5:
+            self._mpv_command("playlist-prev")
+        else:
+            self._mpv_command("seek", 0, "absolute")
+
+    # ---- stats -------------------------------------------------------------
+
+    def record_session(self, minutes):
+        day = datetime.date.today().isoformat()
+        entry = self._stats.setdefault(day, {"sessions": 0, "minutes": 0})
+        entry["sessions"] += 1
+        entry["minutes"] += int(round(minutes))
+        write_json(STATS_FILE, self._stats)
+        self._emit("stats")
+
+    def stats_day(self, day):
+        e = self._stats.get(day.isoformat()) or {}
+        return {"sessions": int(e.get("sessions", 0)), "minutes": int(e.get("minutes", 0))}
+
+    def streak(self):
+        day = datetime.date.today()
+        if not self.stats_day(day)["sessions"]:
+            day -= datetime.timedelta(days=1)  # today may simply not have started yet
+        n = 0
+        while self.stats_day(day)["sessions"]:
+            n += 1
+            day -= datetime.timedelta(days=1)
+        return n
+
+    def week(self):
+        today = datetime.date.today()
+        days = [today - datetime.timedelta(days=i) for i in range(6, -1, -1)]
+        return [(d, self.stats_day(d)["minutes"]) for d in days]
 
     def play_chime(self):
         path = find_data("chime.oga")
@@ -637,9 +862,10 @@ class Ring(Gtk.Widget):
         self.progress = 0.0
         self.is_break = False
         self.dimmed = False
+        self.pulse = False
 
-    def update(self, progress, is_break, dimmed):
-        self.progress, self.is_break, self.dimmed = progress, is_break, dimmed
+    def update(self, progress, is_break, dimmed, pulse=False):
+        self.progress, self.is_break, self.dimmed, self.pulse = progress, is_break, dimmed, pulse
         self.queue_draw()
 
     def do_measure(self, _orientation, _for_size):
@@ -680,6 +906,9 @@ class Ring(Gtk.Widget):
         accent = self._accent()
         if self.dimmed:
             accent = self._rgba(accent.red, accent.green, accent.blue, 0.5)
+        elif self.pulse:  # last 10 seconds: gentle breathing
+            accent = self._rgba(accent.red, accent.green, accent.blue,
+                                0.7 + 0.3 * math.sin(time.time() * 4))
         clear = self._rgba(accent.red, accent.green, accent.blue, 0.0)
         stops = []
         for offset, color in ((0.0, accent), (p, accent), (p + 0.0005, clear), (1.0, clear)):
@@ -705,7 +934,7 @@ class PomodoroWindow(Adw.ApplicationWindow):
             pass
         super().__init__(application=app, title=APP_NAME,
                          default_width=440, default_height=max(420, height))
-        self.set_size_request(340, 420)
+        self.set_size_request(360, 420)
         self.engine = engine
         self._guard = False
         self._music_rows = []
@@ -715,49 +944,64 @@ class PomodoroWindow(Adw.ApplicationWindow):
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
+        self.stack = Adw.ViewStack(vexpand=True, hexpand=True)
         header.set_title_widget(Adw.WindowTitle(title=APP_NAME, subtitle=""))
         menu = Gio.Menu()
         menu.append("Preferences", "app.preferences")
+        menu.append("Show Music Log", "app.open-log")
         menu.append("About Pomodoro", "app.about")
         menu.append("Quit", "app.quit")
-        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic",
-                                       menu_model=menu, primary=True,
-                                       tooltip_text="Main Menu"))
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                                       primary=True, tooltip_text="Main Menu"))
         toolbar.add_top_bar(header)
 
-        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
-                                      vexpand=True)
-        clamp = Adw.Clamp(maximum_size=480, tightening_threshold=400,
-                          margin_top=12, margin_bottom=24,
-                          margin_start=12, margin_end=12)
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
-        clamp.set_child(page)
-        scroller.set_child(clamp)
-        toolbar.set_content(scroller)
-        self.set_content(toolbar)
+        self.stack.add_titled_with_icon(self._page(self._build_timer_page()),
+                                        "timer", "Timer", "alarm-symbolic")
+        self.stack.add_titled_with_icon(self._page(self._build_music_page()),
+                                        "music", "Music", "audio-x-generic-symbolic")
+        self.stack.add_titled_with_icon(self._page(self._build_stats_page()),
+                                        "stats", "Stats", "starred-symbolic")
+        self.stack.connect("notify::visible-child-name", lambda *_: self._refresh_stats())
 
-        page.append(self._build_timer())
-        page.append(self._build_controls())
-        page.append(self._build_focus_length())
-        self.music_group = Adw.PreferencesGroup(title="Music")
-        self.ambient_group = Adw.PreferencesGroup(title="Ambient")
-        page.append(self.music_group)
-        page.append(self.ambient_group)
-        page.append(self._build_volume())
+        self.phase_box = Gtk.Box()
+        self.phase_box.append(self.stack)
+        self.toasts = Adw.ToastOverlay(child=self.phase_box)
+        toolbar.set_content(self.toasts)
+        toolbar.add_bottom_bar(Adw.ViewSwitcherBar(stack=self.stack, reveal=True))
+        self.set_content(toolbar)
 
         self.connect("close-request", self._on_close)
         engine.listeners.append(self._on_engine)
-        self.connect("destroy", lambda *_: engine.listeners.remove(self._on_engine)
-                     if self._on_engine in engine.listeners else None)
+        self._eq_id = GLib.timeout_add(220, self._eq_step)
+        self.connect("destroy", self._on_destroy)
 
         self._rebuild_music()
         self._sync_focus_buttons()
         self._refresh()
+        self._refresh_stats()
         self.play_btn.grab_focus()
 
-    # ---- building ---------------------------------------------------------
+    def _on_destroy(self, *_args):
+        if self._eq_id:
+            GLib.source_remove(self._eq_id)
+            self._eq_id = 0
+        if self._on_engine in self.engine.listeners:
+            self.engine.listeners.remove(self._on_engine)
 
-    def _build_timer(self):
+    def _page(self, child):
+        clamp = Adw.Clamp(maximum_size=480, tightening_threshold=400,
+                          margin_top=12, margin_bottom=24, margin_start=12,
+                          margin_end=12, child=child)
+        return Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                  vexpand=True, child=clamp)
+
+    def show_toast(self, text):
+        self.toasts.add_toast(Adw.Toast.new(GLib.markup_escape_text(text)))
+
+    # ---- timer page -------------------------------------------------------
+
+    def _build_timer_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
         self.ring = Ring()
         overlay = Gtk.Overlay(halign=Gtk.Align.CENTER)
         overlay.set_child(self.ring)
@@ -766,32 +1010,33 @@ class PomodoroWindow(Adw.ApplicationWindow):
         self.phase_label = Gtk.Label(css_classes=["heading"])
         self.time_label = Gtk.Label(css_classes=["pomo-time"])
         self.session_label = Gtk.Label(css_classes=["caption", "dim-label"])
-        inner.append(self.phase_label)
-        inner.append(self.time_label)
-        inner.append(self.session_label)
+        for w in (self.phase_label, self.time_label, self.session_label):
+            inner.append(w)
         overlay.add_overlay(inner)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.append(overlay)
-        return box
+        page.append(overlay)
 
-    def _build_controls(self):
-        box = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
-        self.reset_btn = Gtk.Button(icon_name="edit-undo-symbolic",
-                                    css_classes=["circular"], valign=Gtk.Align.CENTER,
-                                    tooltip_text="Reset")
+        dots = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        self.dots = [Gtk.Box(css_classes=["pomo-dot"], valign=Gtk.Align.CENTER)
+                     for _ in range(CYCLE)]
+        for d in self.dots:
+            dots.append(d)
+        page.append(dots)
+
+        controls = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
+        self.reset_btn = Gtk.Button(icon_name="edit-undo-symbolic", tooltip_text="Reset",
+                                    css_classes=["circular"], valign=Gtk.Align.CENTER)
         self.play_btn = Gtk.Button(css_classes=["circular", "suggested-action", "pomo-play"],
                                    valign=Gtk.Align.CENTER)
         self.skip_btn = Gtk.Button(icon_name="media-skip-forward-symbolic",
-                                   css_classes=["circular"], valign=Gtk.Align.CENTER,
-                                   tooltip_text="Skip")
+                                   tooltip_text="Skip", css_classes=["circular"],
+                                   valign=Gtk.Align.CENTER)
         self.reset_btn.connect("clicked", lambda *_: self.engine.reset())
         self.play_btn.connect("clicked", lambda *_: self.engine.start_or_pause())
         self.skip_btn.connect("clicked", lambda *_: self.engine.skip())
         for b in (self.reset_btn, self.play_btn, self.skip_btn):
-            box.append(b)
-        return box
+            controls.append(b)
+        page.append(controls)
 
-    def _build_focus_length(self):
         group = Adw.PreferencesGroup(title="Focus length",
                                      description="Changes apply from the next session.")
         row = Adw.ActionRow(title="Minutes")
@@ -809,18 +1054,31 @@ class PomodoroWindow(Adw.ApplicationWindow):
             linked.append(btn)
         row.add_suffix(linked)
         group.add(row)
-
         self.custom_row = Adw.SpinRow(
             title="Custom length", subtitle="Minutes",
             adjustment=Gtk.Adjustment(lower=1, upper=600, step_increment=1,
-                                      page_increment=5,
-                                      value=self.engine.focus_minutes))
+                                      page_increment=5, value=self.engine.focus_minutes))
         self.custom_row.connect("notify::value", self._on_custom_changed)
         group.add(self.custom_row)
-        return group
+        page.append(group)
+        return page
 
-    def _build_volume(self):
-        group = Adw.PreferencesGroup()
+    # ---- music page -------------------------------------------------------
+
+    def _build_music_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        page.append(self._build_now_playing())
+
+        group = Adw.PreferencesGroup(title="Sources")
+        self.src_exp = Adw.ExpanderRow(title="YouTube and channels")
+        self.src_exp.add_prefix(Gtk.Image(icon_name="audio-x-generic-symbolic"))
+        self.amb_exp = Adw.ExpanderRow(title="Ambient sounds")
+        self.amb_exp.add_prefix(Gtk.Image(icon_name="weather-showers-symbolic"))
+        group.add(self.src_exp)
+        group.add(self.amb_exp)
+        page.append(group)
+
+        vol = Adw.PreferencesGroup()
         row = Adw.ActionRow(title="Volume")
         self.volume_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.volume_scale.set_value(self.engine.volume)
@@ -830,54 +1088,153 @@ class PomodoroWindow(Adw.ApplicationWindow):
         self.volume_scale.connect(
             "value-changed", lambda s: self.engine.set_volume(s.get_value()))
         row.add_suffix(self.volume_scale)
-        group.add(row)
-
+        vol.add(row)
         restart = Adw.ActionRow(title="Restart music",
                                 subtitle="If the audio went quiet, e.g. after a call",
                                 activatable=True)
         restart.add_suffix(Gtk.Image(icon_name="view-refresh-symbolic"))
         restart.connect("activated", lambda *_: self.engine.replay_music())
-        group.add(restart)
-        return group
+        vol.add(restart)
+        page.append(vol)
+        return page
+
+    def _build_now_playing(self):
+        card = Gtk.Box(css_classes=["card"])
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True,
+                        margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+        card.append(inner)
+
+        top = Gtk.Box(spacing=12)
+        eq = Gtk.Box(spacing=3, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+        eq.set_size_request(30, 26)
+        self.eq_bars = []
+        for _ in range(4):
+            bar = Gtk.Box(css_classes=["eq-bar"], valign=Gtk.Align.END)
+            bar.set_size_request(4, 4)
+            self.eq_bars.append(bar)
+            eq.append(bar)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True,
+                        valign=Gtk.Align.CENTER)
+        self.np_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                                  css_classes=["np-title"])
+        self.np_sub = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                                css_classes=["caption", "dim-label"])
+        texts.append(self.np_title)
+        texts.append(self.np_sub)
+        top.append(eq)
+        top.append(texts)
+        inner.append(top)
+
+        self.np_progress = Gtk.ProgressBar()
+        self.np_time = Gtk.Label(css_classes=["caption", "dim-label"])
+        inner.append(self.np_progress)
+        inner.append(self.np_time)
+
+        controls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        self.np_prev = Gtk.Button(icon_name="media-skip-backward-symbolic",
+                                  css_classes=["circular", "flat"], tooltip_text="Previous")
+        self.np_play = Gtk.Button(css_classes=["circular"], tooltip_text="Pause / resume")
+        self.np_next = Gtk.Button(icon_name="media-skip-forward-symbolic",
+                                  css_classes=["circular", "flat"], tooltip_text="Next")
+        self.np_prev.connect("clicked", lambda *_: self.engine.music_prev())
+        self.np_play.connect("clicked", lambda *_: self.engine.music_toggle_pause())
+        self.np_next.connect("clicked", lambda *_: self.engine.music_next())
+        for b in (self.np_prev, self.np_play, self.np_next):
+            controls.append(b)
+        inner.append(controls)
+        return card
+
+    # ---- stats page -------------------------------------------------------
+
+    def _build_stats_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        today = Adw.PreferencesGroup(title="Today")
+        self.st_sessions = Gtk.Label(css_classes=["dim-label"])
+        self.st_minutes = Gtk.Label(css_classes=["dim-label"])
+        self.st_streak = Gtk.Label(css_classes=["dim-label"])
+        for title, label in (("Focus sessions", self.st_sessions),
+                             ("Focus time", self.st_minutes),
+                             ("Current streak", self.st_streak)):
+            row = Adw.ActionRow(title=title)
+            row.add_suffix(label)
+            today.add(row)
+        page.append(today)
+
+        week = Adw.PreferencesGroup(title="Last 7 days")
+        chart = Gtk.Box(spacing=8, homogeneous=True, margin_top=6, margin_bottom=6)
+        self.week_cols = []
+        for _ in range(7):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            holder = Gtk.Box(valign=Gtk.Align.END, halign=Gtk.Align.CENTER, vexpand=True)
+            holder.set_size_request(-1, 84)
+            bar = Gtk.Box(css_classes=["week-bar"], valign=Gtk.Align.END)
+            bar.set_size_request(20, 4)
+            holder.append(bar)
+            lbl = Gtk.Label(css_classes=["caption", "dim-label"])
+            col.append(holder)
+            col.append(lbl)
+            chart.append(col)
+            self.week_cols.append((bar, lbl))
+        week.add(chart)
+        page.append(week)
+        return page
+
+    def _refresh_stats(self):
+        e = self.engine
+        day = e.stats_day(datetime.date.today())
+        self.st_sessions.set_label(str(day["sessions"]))
+        self.st_minutes.set_label(fmt_minutes(day["minutes"]))
+        n = e.streak()
+        self.st_streak.set_label("%d day%s" % (n, "" if n == 1 else "s"))
+        week = e.week()
+        top = max([m for _d, m in week] + [1])
+        for i, ((d, m), (bar, lbl)) in enumerate(zip(week, self.week_cols)):
+            bar.set_size_request(20, max(4, int(80 * m / top)))
+            bar.set_tooltip_text(fmt_minutes(m))
+            lbl.set_label(d.strftime("%a")[:1])
+            (bar.add_css_class if i == 6 else bar.remove_css_class)("today")
 
     # ---- music list -------------------------------------------------------
 
-    def _radio_row(self, group, title, icon, value, subtitle=""):
+    def _radio_row(self, expander, title, icon, value, subtitle=""):
         row = Adw.ActionRow(title=GLib.markup_escape_text(title),
-                            subtitle=GLib.markup_escape_text(subtitle),
-                            subtitle_lines=1)
+                            subtitle=GLib.markup_escape_text(subtitle), subtitle_lines=1)
         row.add_prefix(Gtk.Image(icon_name=icon))
         check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
         check.set_group(self._radio_leader)
         check.connect("toggled", self._on_radio_toggled, value)
         row.add_suffix(check)
         row.set_activatable_widget(check)
-        group.add(row)
-        self._music_rows.append((group, row))
+        expander.add_row(row)
+        self._music_rows.append((expander, row))
         self._radios[value] = check
 
     def _rebuild_music(self):
         snapshot = json.dumps(self.engine.channels)
         if snapshot != self._channel_snapshot:
             self._channel_snapshot = snapshot
-            for group, row in self._music_rows:
-                group.remove(row)
+            for expander, row in self._music_rows:
+                expander.remove(row)
             self._music_rows = []
             self._radios = {}
             for c in self.engine.channels:
                 short = re.sub(r"^https?://(www\.)?", "", c["url"])
-                self._radio_row(self.music_group, c["name"],
-                                "audio-x-generic-symbolic", c["url"], short)
-            self.music_group.set_visible(bool(self.engine.channels))
+                self._radio_row(self.src_exp, c["name"], "audio-x-generic-symbolic",
+                                c["url"], short)
+            self.src_exp.set_visible(bool(self.engine.channels))
             for amb_id, label, icon, _src in AMBIENT:
-                self._radio_row(self.ambient_group, label, icon, "ambient:" + amb_id)
-            self._radio_row(self.ambient_group, "No music",
-                            "audio-volume-muted-symbolic", "")
+                self._radio_row(self.amb_exp, label, icon, "ambient:" + amb_id)
+            self._radio_row(self.amb_exp, "No music", "audio-volume-muted-symbolic", "")
         self._guard = True
         active = self._radios.get(self.engine.channel) or self._radios.get("")
         if active:
             active.set_active(True)
         self._guard = False
+        ch = self.engine.channel
+        name = GLib.markup_escape_text(self.engine.channel_name(ch))
+        self.src_exp.set_subtitle(name if ch.startswith("http") else "")
+        self.amb_exp.set_subtitle(name if ch.startswith("ambient:")
+                                  else ("No music" if not ch else ""))
 
     def _on_radio_toggled(self, check, value):
         if self._guard or not check.get_active():
@@ -917,11 +1274,20 @@ class PomodoroWindow(Adw.ApplicationWindow):
         if event == "settings":
             self._rebuild_music()
             self._sync_focus_buttons()
+        elif event == "stats":
+            self._refresh_stats()
         self._refresh()
+
+    def _eq_step(self):
+        playing = self.engine.music_status == "Playing"
+        for bar in self.eq_bars:
+            bar.set_size_request(4, random.randint(6, 26) if playing else 4)
+        return GLib.SOURCE_CONTINUE
 
     def _refresh(self):
         e = self.engine
-        label = {"idle": "Ready", "focus": "Focus", "break": "Break"}[e.phase]
+        label = {"idle": "Ready", "focus": "Focus",
+                 "break": "Long break" if e.long_break else "Break"}[e.phase]
         time_text = format_time(e.left_ms)
         self.time_label.set_label(time_text)
         self.phase_label.set_label(label)
@@ -934,7 +1300,16 @@ class PomodoroWindow(Adw.ApplicationWindow):
             session += (" · " if session else "") + "Paused"
         self.session_label.set_label(session)
         self.session_label.set_visible(bool(session))
-        self.ring.update(e.progress, e.phase == "break", e.paused)
+        self.ring.update(e.progress, e.phase == "break", e.paused,
+                         e.running and e.left_ms < 10000)
+
+        filled = CYCLE if (e.phase == "break" and e.long_break) else e.sessions_done % CYCLE
+        for i, d in enumerate(self.dots):
+            (d.add_css_class if i < filled else d.remove_css_class)("filled")
+        for c in ("phase-focus", "phase-break"):
+            self.phase_box.remove_css_class(c)
+        if e.phase != "idle":
+            self.phase_box.add_css_class("phase-" + e.phase)
 
         if e.running:
             self.play_btn.set_icon_name("media-playback-pause-symbolic")
@@ -945,6 +1320,44 @@ class PomodoroWindow(Adw.ApplicationWindow):
         self.skip_btn.set_sensitive(e.phase != "idle")
         self.reset_btn.set_sensitive(e.phase != "idle")
         self.set_title("%s · %s" % (time_text, label) if e.phase != "idle" else APP_NAME)
+        self._refresh_music()
+
+    def _refresh_music(self):
+        e = self.engine
+        ch = e.channel
+        name = e.channel_name(ch)
+        status = e.music_status
+        if not ch:
+            title, sub = "No music", "Pick a source below"
+        elif e.mpv:
+            title = (name if ch.startswith("ambient:")
+                     else e.now.get("title") or name or "Music")
+            sub = status or "Starting…"
+            count = e.now.get("count")
+            if count and count > 1:
+                sub += " · Track %d of %d" % ((e.now.get("idx") or 0) + 1, count)
+        else:
+            title, sub = name or "Music", "Plays while you focus"
+        self.np_title.set_label(title)
+        self.np_sub.set_label(sub)
+
+        pos, dur = e.now.get("pos"), e.now.get("dur")
+        if e.mpv and e.is_vod and isinstance(pos, (int, float)):
+            self.np_progress.set_visible(True)
+            self.np_progress.set_fraction(max(0.0, min(1.0, pos / dur)))
+            self.np_time.set_label("%s / %s" % (fmt_clock(pos), fmt_clock(dur)))
+        elif e.mpv and isinstance(pos, (int, float)):
+            self.np_progress.set_visible(False)
+            self.np_time.set_label("Live stream")
+        else:
+            self.np_progress.set_visible(False)
+            self.np_time.set_label("")
+        self.np_time.set_visible(bool(self.np_time.get_label()))
+        self.np_prev.set_sensitive(bool(e.mpv and e.is_vod))
+        self.np_next.set_sensitive(bool(e.mpv and (e.now.get("count") or 0) > 1))
+        self.np_play.set_sensitive(e.mpv is not None)
+        self.np_play.set_icon_name("media-playback-start-symbolic" if e.user_paused
+                                   else "media-playback-pause-symbolic")
 
     def _on_close(self, _win):
         # Keep the timer and music going in the background while it runs.
@@ -973,6 +1386,13 @@ class PreferencesDialog(Adw.PreferencesDialog):
         brk.connect("notify::value",
                     lambda r, _p: engine.set_setting("break_minutes", int(r.get_value())))
         timer.add(brk)
+        longb = Adw.SpinRow(
+            title="Long break length", subtitle="Minutes, after every 4th session",
+            adjustment=Gtk.Adjustment(lower=1, upper=120, step_increment=1,
+                                      page_increment=5, value=engine.long_break_minutes))
+        longb.connect("notify::value", lambda r, _p: engine.set_setting(
+            "long_break_minutes", int(r.get_value())))
+        timer.add(longb)
         for key, title, subtitle in (
             ("stop_music_on_break", "Stop music during breaks",
              "Resumes live when focus starts"),
@@ -984,14 +1404,25 @@ class PreferencesDialog(Adw.PreferencesDialog):
                         lambda r, _p, k=key: engine.set_setting(k, r.get_active()))
             timer.add(row)
 
+        conn = Adw.PreferencesGroup(title="Music connection")
+        page.add(conn)
+        combo = Adw.ComboRow(
+            title="Stream compatibility",
+            subtitle="Change this if YouTube music keeps cutting out",
+            model=Gtk.StringList.new(["Automatic"] + [p[0] for p in PROFILES]))
+        combo.set_selected(clamp_int(s["stream_mode"], -1, len(PROFILES) - 1, -1) + 1)
+        combo.connect("notify::selected",
+                      lambda r, _p: engine.set_stream_mode(r.get_selected() - 1))
+        conn.add(combo)
+
         self.channels_group = Adw.PreferencesGroup(
-            title="Channels", description="YouTube live streams or videos used as focus music.")
+            title="Sources", description="YouTube live streams, single videos or playlists.")
         page.add(self.channels_group)
 
-        add_group = Adw.PreferencesGroup(title="Add a channel")
+        add_group = Adw.PreferencesGroup(title="Add a source")
         page.add(add_group)
         self.name_row = Adw.EntryRow(title="Name (e.g. Jazz radio)")
-        self.url_row = Adw.EntryRow(title="YouTube link")
+        self.url_row = Adw.EntryRow(title="YouTube link (video, playlist or live)")
         add_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER,
                              css_classes=["flat"], tooltip_text="Add")
         add_btn.connect("clicked", self._on_add)
@@ -1060,7 +1491,7 @@ class PomodoroApp(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        self.engine = Engine(self._notify)
+        self.engine = Engine(self._notify, self._message)
         self.engine.listeners.append(self._on_engine)
 
         actions = {
@@ -1070,6 +1501,7 @@ class PomodoroApp(Adw.Application):
             "reset": lambda *_: self.engine.reset(),
             "restart-music": lambda *_: self.engine.replay_music(),
             "preferences": self._show_preferences,
+            "open-log": self._open_log,
             "about": self._show_about,
             "quit": lambda *_: self.quit(),
         }
@@ -1105,17 +1537,23 @@ class PomodoroApp(Adw.Application):
         self._present()
         PreferencesDialog(self.engine).present(self.win)
 
+    def _open_log(self, *_args):
+        try:
+            Gio.AppInfo.launch_default_for_uri("file://" + MPV_LOG, None)
+        except GLib.Error:
+            self._notify("No music log yet", "Start a session with music first.")
+
     def _show_about(self, *_args):
         self._present()
         dialog = Adw.AboutDialog(
             application_name=APP_NAME,
             application_icon=APP_ID,
-            developer_name="Alessandro Belli",
+            developer_name="Cydrek Carillo",
             version=VERSION,
             comments="A pomodoro timer with YouTube live streams or ambient sounds "
-                     "as focus music. GNOME port of omarchy-pomodoro.",
+                     "as focus music. Vibe coded GNOME port of omarchy-pomodoro.",
             website=SOURCE_URL,
-            copyright="© 2026 Alessandro Belli",
+            copyright="© 2026 Cydrek Carillo",
             license_type=Gtk.License.MIT_X11,
         )
         dialog.add_acknowledgement_section(
@@ -1128,6 +1566,13 @@ class PomodoroApp(Adw.Application):
         note.set_default_action("app.present")
         note.set_priority(Gio.NotificationPriority.HIGH)
         self.send_notification("pomodoro-phase", note)
+
+    def _message(self, title, body):
+        """Small status messages: a toast if the window is in front, else a notification."""
+        if self.win is not None and self.win.is_visible() and self.win.is_active():
+            self.win.show_toast("%s: %s" % (title, body) if body else title)
+        else:
+            self._notify(title, body)
 
     def _on_engine(self, _event):
         # Stay alive in the background while a session is running.
